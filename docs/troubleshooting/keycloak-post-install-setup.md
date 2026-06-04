@@ -234,6 +234,152 @@ that — it lives in `kube-system` and isn't tracked by the backend
 Application — so it is preferred over patching
 `backend-config.keycloak_internal_url`.
 
+## Authorise the user — `User` / `Group` / `Project` CRs
+
+Authentication now succeeds, but visiting `/projects` (or anything else
+that lists what the user can do) immediately returns:
+
+```
+User CR not found: (404)
+HTTP response body: {"kind":"Status","status":"Failure",
+  "message":"users.identity.k8tre.io \"demo\" not found",
+  "reason":"NotFound","details":{"name":"demo","group":"identity.k8tre.io","kind":"users"},
+  "code":404}
+```
+
+The portal's authorisation model is CR-driven (see
+[`ci/backend/main.py`](../../ci/backend/main.py) `get_namespaced_custom_object`
+calls): every logged-in user needs
+
+1. a `User` (`identity.k8tre.io/v1alpha1`) in the backend's `NAMESPACE`
+   (set by `K8TRE_NAMESPACE`, defaults to `keycloak`) whose `metadata.name`
+   matches the OIDC `preferred_username`,
+2. one or more `Group` (`identity.k8tre.io/v1alpha1`) referenced from
+   `User.spec.groups`, and
+3. for each project listed in `Group.spec.projects`, a `Project`
+   (`research.k8tre.io/v1alpha1`).
+
+The example manifests under
+[`apps/keycloak/base/identity-management/`](../../apps/keycloak/base/identity-management/)
+were disabled in commit `ecb12b7` because the CRDs themselves are not yet
+in the repo. There is no controller that reconciles
+`KeycloakClient`/`User`/`Group` either — these are purely declarative
+"intent" objects the portal reads at runtime.
+
+### Install the CRDs
+
+Permissive schemas (no field validation) are enough to unblock the portal —
+the backend reads `.spec` with `.get()` and never validates structure:
+
+```sh
+kubectl apply -f - <<'EOF'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata: {name: users.identity.k8tre.io}
+spec:
+  group: identity.k8tre.io
+  scope: Namespaced
+  names: {plural: users, singular: user, kind: User, shortNames: [usr]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties: {spec: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata: {name: groups.identity.k8tre.io}
+spec:
+  group: identity.k8tre.io
+  scope: Namespaced
+  names: {plural: groups, singular: group, kind: Group, shortNames: [grp]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties: {spec: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata: {name: projects.research.k8tre.io}
+spec:
+  group: research.k8tre.io
+  scope: Namespaced
+  names: {plural: projects, singular: project, kind: Project, shortNames: [prj]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties: {spec: {type: object, x-kubernetes-preserve-unknown-fields: true}}
+EOF
+```
+
+### Create the demo user / group / project
+
+```sh
+NAMESPACE=keycloak                  # value of K8TRE_NAMESPACE on the backend
+DOMAIN=188.34.94.28.nip.io
+
+kubectl apply -f - <<EOF
+apiVersion: identity.k8tre.io/v1alpha1
+kind: User
+metadata:
+  name: demo                        # must match Keycloak preferred_username
+  namespace: $NAMESPACE
+spec:
+  username: demo
+  email: demo@example.com
+  enabled: true
+  groups: ["demo-group"]
+---
+apiVersion: identity.k8tre.io/v1alpha1
+kind: Group
+metadata:
+  name: demo-group
+  namespace: $NAMESPACE
+spec:
+  description: "Demo group"
+  projects: ["demo-project"]
+---
+apiVersion: research.k8tre.io/v1alpha1
+kind: Project
+metadata:
+  name: demo-project
+  namespace: $NAMESPACE
+spec:
+  description: "Demo research project"
+  apps:
+    - name: jupyterhub
+      type: jupyterhub
+      url: "https://jupyter.$DOMAIN/hub"
+    - name: guacamole
+      type: vdi
+      url: "https://guacamole.$DOMAIN"
+      config:
+        protocol: rdp
+        resolution: "1920x1080"
+        desktop: "ubuntu-mate"
+EOF
+```
+
+Reload `/projects` in the browser — you should now see the *Demo research
+project* card with JupyterHub and Guacamole links.
+
+> The `apps/keycloak/base/identity-management/` directory has richer
+> example `users.yaml`, `groups.yaml`, `projects.yaml` (the `alwin`,
+> `asthma`, `diabetes` set). They are usable as a more realistic seed once
+> the CRDs above are in place — the manifests in step 2 above are just the
+> minimum that unblocks the demo user.
+
 ## Verification
 
 ```sh
@@ -287,13 +433,11 @@ them is currently in the repo:
 3. **The `groups` protocol mapper** on each client so the OIDC token
    includes the user's full group path — required by JupyterHub for the
    project-based namespacing.
-4. **Group → project mappings**. The portal's `Project` CR
-   (`research.k8tre.io/v1alpha1`, see
-   `apps/keycloak/base/identity-management/projects.yaml`) currently has
-   neither a CRD nor a reconciler. Until one ships, projects exist only in
-   the static `projects-patch.yaml` file (and that file is what triggered
-   [PR #6](https://github.com/eggai-tech/k8tre/pull/6), which had to disable
-   the patch to make `kustomize build` succeed at all).
+4. **A reconciler for the identity CRDs.** This page installs permissive
+   CRDs and creates `User`/`Group`/`Project` resources manually for the
+   `demo` user; a real controller would (a) keep Keycloak users / groups
+   in sync with the cluster CRs and (b) materialize `KeycloakClient` CRs
+   into actual Keycloak clients via the Admin API.
 
 ## Suggested upstream improvements
 
