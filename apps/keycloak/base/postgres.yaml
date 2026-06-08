@@ -8,8 +8,14 @@ metadata:
 spec:
   instances: 1
   storage:
-    size: 512Mi # Reduced from 1Gi to use less storage
+    # 2Gi: CNPG's instance manager refuses to start the postgres process
+    # when free space falls below the WAL safety threshold; with the
+    # previous 512Mi the empty base data already triggered the check and
+    # the pod was stuck in CrashLoopBackOff with "Detected low-disk space
+    # condition, avoid starting the instance".
+    size: 2Gi
     storageClass: rwo-default
+    resizeInUseVolumes: true
   imagePullPolicy: Always
   resources:
     requests:
