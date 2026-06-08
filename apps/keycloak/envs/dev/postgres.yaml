@@ -8,7 +8,8 @@ metadata:
 spec:
   instances: 1
   storage:
-    size: 512Mi # Reduced from 1Gi to use less storage
+    # See apps/keycloak/base/postgres.yaml for why this is 2Gi and not less.
+    size: 2Gi
   imagePullPolicy: Always
   resources:
     requests:
