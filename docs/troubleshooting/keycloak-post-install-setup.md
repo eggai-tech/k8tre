@@ -104,6 +104,66 @@ secrets land in the cluster — the `KeycloakClient` CRs under
 `apps/keycloak/base/identity-management/keycloak.yaml` are the authoritative
 reference for `redirectUris`, `webOrigins`, scopes and protocol mappers.
 
+## Add the `aud` (audience) protocol mapper
+
+Each client also needs an explicit *audience* mapper, otherwise Keycloak
+issues access tokens **without** an `aud` claim and the backend rejects them
+in `verify_token` with:
+
+```
+Token verification failed: Token is missing the "aud" claim
+Project-specific cookie auth token verification failed: 401: Invalid token
+Hub path without query token -> 401
+```
+
+This surfaces in the user flow as: portal login works, `/projects` works,
+but clicking *Launch JupyterHub* (or any subdomain that goes through
+`jhub-auth-proxy` → `/auth/validate`) bounces back to the portal login page
+forever.
+
+Create one `oidc-audience-mapper` per client (the `included.client.audience`
+value matches the client's own `clientId`, which is what
+`KEYCLOAK_AUDIENCE` on the backend Deployment expects):
+
+```sh
+ADMIN_USER=$(kubectl get secret -n keycloak keycloak-admin-credentials -o jsonpath='{.data.username}'      | base64 -d)
+ADMIN_PWD=$( kubectl get secret -n keycloak keycloak-admin-credentials -o jsonpath='{.data.admin-password}' | base64 -d)
+POD=keycloak-keycloakx-0
+
+kubectl exec -n keycloak $POD -- \
+  /opt/keycloak/bin/kcadm.sh config credentials \
+    --server http://localhost:8080 --realm master \
+    --user "$ADMIN_USER" --password "$ADMIN_PWD"
+
+for CLIENT in backend jupyterhub; do
+  CID=$(kubectl exec -n keycloak $POD -- \
+    /opt/keycloak/bin/kcadm.sh get clients -r k8tre-app \
+      -q clientId=$CLIENT --fields id --format csv \
+    | head -1 | tr -d '"')
+
+  kubectl exec -n keycloak $POD -i -- \
+    /opt/keycloak/bin/kcadm.sh create -r k8tre-app \
+      clients/$CID/protocol-mappers/models -f - <<JSON
+{
+  "name": "audience-$CLIENT",
+  "protocol": "openid-connect",
+  "protocolMapper": "oidc-audience-mapper",
+  "consentRequired": false,
+  "config": {
+    "included.client.audience": "$CLIENT",
+    "id.token.claim": "false",
+    "access.token.claim": "true",
+    "user.info.claim": "false"
+  }
+}
+JSON
+done
+```
+
+Existing browser sessions still hold the old tokens — users must log out
+of the portal (or wait for the access token to expire and refresh) before
+the next login picks up the audience claim.
+
 ## Create a demo user
 
 A working OIDC client is not enough — Keycloak rejects login without an
@@ -413,10 +473,53 @@ If this hangs, the CoreDNS hosts override is missing or pointing at the
 wrong IP — re-do the *Fix: CoreDNS hosts override → VM host IP* step.
 
 ```sh
-# 4) Complete browser flow
+# 4) Access token actually carries an `aud` claim for the client
+curl -k -s -X POST \
+  "https://keycloak.<domain>/realms/k8tre-app/protocol/openid-connect/token" \
+  -d "grant_type=password" \
+  -d "client_id=backend" \
+  -d "client_secret=$(kubectl get secret -n backend backend-oidc-credentials -o jsonpath='{.data.client-secret}' | base64 -d)" \
+  -d "username=demo" -d "password=demo" \
+  -d "scope=openid profile email" \
+| python3 -c "import sys, json, base64;
+t = json.load(sys.stdin)['access_token'].split('.')[1]
+print(json.dumps(json.loads(base64.urlsafe_b64decode(t + '==')).get('aud'), indent=2))"
+# expect: "backend"  (or ["backend", "account"]); if `null` the audience
+# mapper from §"Add the `aud` (audience) protocol mapper" is missing.
+
+# 5) Complete browser flow
 # Open https://portal.<domain>/ in a private window, click "Login with
-# Keycloak SSO", enter demo/demo. The redirect should resolve in a few
-# hundred milliseconds and land on /projects without the Login button.
+# Keycloak SSO", enter demo/demo. From /projects click *Launch* on
+# JupyterHub. The browser ends up on https://jupyter.<domain>/hub/ without
+# bouncing back to the portal Login button.
+```
+
+## Runtime issue — keycloak goes down with "low-disk space"
+
+After a few days of real use the keycloak pod may show as Ready=0/1 and
+the CNPG postgres pod keeps CrashLoopBackOff'ing with:
+
+```
+Detected low-disk space condition, avoid starting the instance
+```
+
+Root cause: the CNPG instance manager runs a pre-start WAL free-space
+check (`ensure_sufficient_disk_space`) and refuses to start postgres
+below a safety threshold. The original
+[`apps/keycloak/base/postgres.yaml`](../../apps/keycloak/base/postgres.yaml)
+set `storage.size: 512Mi`, which is small enough that even the empty
+base data trips the check.
+
+Fix: [PR #8](https://github.com/eggai-tech/k8tre/pull/8) raises the size
+to **2Gi** and adds `resizeInUseVolumes: true`. Live clusters get the
+PVC expanded online by the CNPG operator + Longhorn — the Longhorn
+`rwo-default` StorageClass already has `allowVolumeExpansion: true`. If
+the pod is stuck in CrashLoopBackOff after the spec change, force-delete
+the pod to bypass the back-off so it picks the resized filesystem up:
+
+```sh
+kubectl delete pod -n keycloak keycloak-postgres-cluster-1 \
+  --force --grace-period=0
 ```
 
 ## What's still missing for a complete setup
