@@ -277,9 +277,170 @@ test_netpol() {
   kubectl delete pod -n "project-${PROJECT_A}" net-client --force --grace-period=0 >/dev/null 2>&1
 }
 
-# ---- Test 5 — User CR validation -------------------------------------------
+# ---- Test 5 — Cross-project volume access ----------------------------------
+test_volume() {
+  section "Test 5 — Volume isolation: PVC in project ${PROJECT_A} unreachable from project ${PROJECT_B}"
+
+  local pvc=secret-${PROJECT_A}-data
+  local sentinel="SECRET_${PROJECT_A^^}: only-for-${PROJECT_A}-team"
+  local sa_b="system:serviceaccount:project-${PROJECT_B}:default"
+
+  # Cleanup any previous run
+  kubectl delete pod ${PROJECT_A}-writer ${PROJECT_A}-reader -n "project-${PROJECT_A}" \
+    --ignore-not-found --force --grace-period=0 >/dev/null 2>&1
+  kubectl delete pod ${PROJECT_B}-thief-name -n "project-${PROJECT_B}" \
+    --ignore-not-found --force --grace-period=0 >/dev/null 2>&1
+  kubectl delete pvc "$pvc" -n "project-${PROJECT_A}" --ignore-not-found >/dev/null 2>&1
+  kubectl delete pvc "stolen-via-volume-name" -n "project-${PROJECT_B}" --ignore-not-found >/dev/null 2>&1
+
+  # --- 5a) create PVC in PROJECT_A and write sentinel ---
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: ${pvc}, namespace: project-${PROJECT_A}}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: rwo-default
+  resources: {requests: {storage: 256Mi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: ${PROJECT_A}-writer, namespace: project-${PROJECT_A}}
+spec:
+  restartPolicy: OnFailure
+  containers:
+  - name: w
+    image: alpine:3.20
+    command: ["sh","-c","echo '${sentinel}' > /data/secret.txt; sync; sleep 3"]
+    volumeMounts: [{name: d, mountPath: /data}]
+  volumes:
+  - {name: d, persistentVolumeClaim: {claimName: ${pvc}}}
+YAML
+
+  # Wait for writer to finish
+  local phase=""
+  for i in $(seq 60); do
+    phase=$(kubectl get pod -n "project-${PROJECT_A}" "${PROJECT_A}-writer" -o jsonpath='{.status.phase}' 2>/dev/null)
+    [ "$phase" = "Succeeded" ] && break
+    [ "$phase" = "Failed" ] && break
+    sleep 2
+  done
+  [ "$phase" = "Succeeded" ] && pass "sentinel written to ${pvc} (writer phase=$phase)" \
+    || { fail "writer phase=$phase — abort volume test"; return; }
+
+  # --- 5b) PROJECT_A's own pod can read the sentinel back ---
+  kubectl run "${PROJECT_A}-reader" -n "project-${PROJECT_A}" --image=alpine:3.20 --restart=Never \
+    --overrides="{\"spec\":{\"containers\":[{\"name\":\"r\",\"image\":\"alpine:3.20\",\"command\":[\"cat\",\"/data/secret.txt\"],\"volumeMounts\":[{\"name\":\"d\",\"mountPath\":\"/data\"}]}],\"volumes\":[{\"name\":\"d\",\"persistentVolumeClaim\":{\"claimName\":\"${pvc}\"}}]}}" \
+    --command -- cat /data/secret.txt >/dev/null 2>&1
+
+  for i in $(seq 60); do
+    phase=$(kubectl get pod -n "project-${PROJECT_A}" "${PROJECT_A}-reader" -o jsonpath='{.status.phase}' 2>/dev/null)
+    [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ] && break
+    sleep 2
+  done
+  local content
+  content=$(kubectl logs -n "project-${PROJECT_A}" "${PROJECT_A}-reader" 2>/dev/null)
+  if echo "$content" | grep -qF "$sentinel"; then
+    pass "${PROJECT_A} reader sees the sentinel from its own PVC"
+  else
+    fail "${PROJECT_A} reader did not see the sentinel: '$content'"
+  fi
+
+  # --- 5c) RBAC: PROJECT_B's default SA cannot touch PROJECT_A's PVC ---
+  for verb in get list create delete patch; do
+    local can
+    can=$(kubectl auth can-i $verb pvc/$pvc -n "project-${PROJECT_A}" --as=$sa_b 2>&1)
+    [ "$can" = "no" ] && pass "$sa_b cannot $verb pvc/$pvc -n project-${PROJECT_A}" \
+                     || fail "$sa_b CAN $verb pvc/$pvc -n project-${PROJECT_A} (got: $can)"
+  done
+
+  # --- 5d) Pod in PROJECT_B referencing claimName=$pvc must stay Pending ---
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: ${PROJECT_B}-thief-name, namespace: project-${PROJECT_B}}
+spec:
+  restartPolicy: Never
+  containers:
+  - {name: t, image: alpine:3.20, command: ["sh","-c","cat /steal/secret.txt || echo NO-DATA"], volumeMounts: [{name: s, mountPath: /steal}]}
+  volumes:
+  - {name: s, persistentVolumeClaim: {claimName: ${pvc}}}
+YAML
+  sleep 6
+  phase=$(kubectl get pod -n "project-${PROJECT_B}" "${PROJECT_B}-thief-name" -o jsonpath='{.status.phase}')
+  local msg
+  msg=$(kubectl get pod -n "project-${PROJECT_B}" "${PROJECT_B}-thief-name" -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].message}')
+  if [ "$phase" = "Pending" ] && echo "$msg" | grep -q 'not found'; then
+    pass "pod in project-${PROJECT_B} stays Pending — k8s does NOT cross-resolve claimName"
+  else
+    fail "pod in project-${PROJECT_B} reached phase=$phase (msg: $msg)"
+  fi
+
+  # --- 5e) Cluster-scoped PV — try direct claimRef hijack with volumeName ---
+  # An admin tries to bind a brand-new PVC in PROJECT_B to the existing PV
+  # already locked to PROJECT_A. The PV controller refuses because the PV's
+  # claimRef immutably points at the alpha PVC.
+  local pv
+  pv=$(kubectl get pvc -n "project-${PROJECT_A}" "$pvc" -o jsonpath='{.spec.volumeName}')
+  kubectl apply -f - >/dev/null 2>&1 <<YAML
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: stolen-via-volume-name, namespace: project-${PROJECT_B}}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  resources: {requests: {storage: 256Mi}}
+  volumeName: ${pv}
+YAML
+  sleep 8
+  local theft_status theft_event
+  theft_status=$(kubectl get pvc -n "project-${PROJECT_B}" stolen-via-volume-name -o jsonpath='{.status.phase}' 2>/dev/null)
+  theft_event=$(kubectl get events -n "project-${PROJECT_B}" --field-selector involvedObject.name=stolen-via-volume-name -o jsonpath='{.items[-1:].message}' 2>/dev/null)
+  if [ "$theft_status" = "Pending" ] && echo "$theft_event" | grep -qi 'already bound'; then
+    pass "PV refuses cross-ns claimRef hijack — status=$theft_status: $theft_event"
+  elif [ "$theft_status" = "Bound" ]; then
+    fail "PV bound to a project-${PROJECT_B} PVC — cluster-scoped PV ISOLATION BROKEN"
+  else
+    pass "stolen PVC did not bind (status=$theft_status, event='$theft_event')"
+  fi
+
+  # --- 5f) hostPath escape — currently allowed (no PodSecurity enforce) ---
+  # Documented in docs/troubleshooting/volume-isolation.md: PSA is not on, so
+  # anyone who can create a pod in project-${PROJECT_B} can mount the node's
+  # /var/lib/longhorn and read every project's raw blocks. We report this as
+  # WEAK rather than FAIL so the suite stays useful on un-hardened clusters.
+  kubectl delete pod -n "project-${PROJECT_B}" host-escape --ignore-not-found --force --grace-period=0 >/dev/null 2>&1
+  kubectl apply -f - >/dev/null 2>&1 <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: host-escape, namespace: project-${PROJECT_B}}
+spec:
+  restartPolicy: Never
+  containers:
+  - {name: t, image: alpine:3.20, command: ["sleep","30"], volumeMounts: [{name: h, mountPath: /host}]}
+  volumes:
+  - {name: h, hostPath: {path: /var/lib/longhorn}}
+YAML
+  sleep 5
+  phase=$(kubectl get pod -n "project-${PROJECT_B}" host-escape -o jsonpath='{.status.phase}' 2>/dev/null)
+  if [ "$phase" = "Running" ] || [ "$phase" = "Pending" ]; then
+    weak "hostPath /var/lib/longhorn admitted in project-${PROJECT_B} (phase=$phase)"
+    weak "  → apply pod-security.kubernetes.io/enforce=baseline on project namespaces"
+    weak "  → see docs/troubleshooting/volume-isolation.md"
+  else
+    pass "hostPath /var/lib/longhorn denied by admission (phase=$phase)"
+  fi
+
+  # --- cleanup ---
+  kubectl delete pod -n "project-${PROJECT_A}" "${PROJECT_A}-writer" "${PROJECT_A}-reader" --ignore-not-found --force --grace-period=0 >/dev/null 2>&1
+  kubectl delete pod -n "project-${PROJECT_B}" "${PROJECT_B}-thief-name" host-escape --ignore-not-found --force --grace-period=0 >/dev/null 2>&1
+  kubectl delete pvc -n "project-${PROJECT_B}" stolen-via-volume-name --ignore-not-found >/dev/null 2>&1
+  # leave the alpha PVC behind — idempotent re-runs reuse it
+}
+
+# ---- Test 6 — User CR validation -------------------------------------------
 test_user_cr() {
-  section "Test 5 — User → Group → Project graph integrity"
+  section "Test 6 — User → Group → Project graph integrity"
 
   for u in "$USER_A:$PROJECT_A:$PROJECT_B" "$USER_B:$PROJECT_B:$PROJECT_A"; do
     IFS=':' read -r user own_project other_project <<< "$u"
@@ -302,6 +463,7 @@ main() {
   test_enumeration
   test_rbac
   test_netpol
+  test_volume
   test_user_cr
 
   printf "\n${BOLD}== Summary ==${RESET}\n"
